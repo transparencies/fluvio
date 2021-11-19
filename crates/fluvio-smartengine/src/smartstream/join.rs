@@ -4,7 +4,6 @@ use anyhow::Result;
 use tracing::{debug, instrument};
 use wasmtime::TypedFunc;
 
-use fluvio_spu_schema::server::stream_fetch::SMART_MODULE_API;
 use dataplane::smartstream::{SmartStreamInput, SmartStreamOutput, SmartStreamInternalError};
 use crate::smartstream::{
     SmartEngine, SmartStreamModule, SmartStreamContext, SmartStream, SmartStreamExtraParams,
@@ -23,8 +22,9 @@ impl SmartStreamJoin {
         engine: &SmartEngine,
         module: &SmartStreamModule,
         params: SmartStreamExtraParams,
+        version: i16,
     ) -> Result<Self> {
-        let mut base = SmartStreamContext::new(engine, module, params)?;
+        let mut base = SmartStreamContext::new(engine, module, params, version)?;
         let join_fn: JoinFn = base
             .instance
             .get_typed_func(&mut base.store, JOIN_FN_NAME)?;
@@ -36,7 +36,7 @@ impl SmartStreamJoin {
 impl SmartStream for SmartStreamJoin {
     #[instrument(skip(self, input), name = "Join")]
     fn process(&mut self, input: SmartStreamInput) -> Result<SmartStreamOutput> {
-        let slice = self.base.write_input(&input, SMART_MODULE_API)?;
+        let slice = self.base.write_input(&input)?;
         debug!(len = slice.1, "WASM SLICE");
         let map_output = self.join_fn.call(&mut self.base.store, slice)?;
 
@@ -46,7 +46,7 @@ impl SmartStream for SmartStreamJoin {
             return Err(internal_error.into());
         }
 
-        let output: SmartStreamOutput = self.base.read_output(SMART_MODULE_API)?;
+        let output: SmartStreamOutput = self.base.read_output()?;
         Ok(output)
     }
 

@@ -27,6 +27,7 @@ impl SmartStreamContext {
         wasm_payload: Option<SmartStreamPayload>,
         smart_module: Option<SmartModuleInvocation>,
         smart_stream: Option<SmartStreamInvocation>,
+        version: i16,
         ctx: &DefaultSharedGlobalContext,
     ) -> Result<Option<Self>, ErrorCode> {
         let derived_sm_modules = if let Some(ss_inv) = smart_stream {
@@ -44,12 +45,12 @@ impl SmartStreamContext {
 
         match module {
             Some(smart_module_invocation) => Ok(Some(
-                Self::extract_smartmodule_context(smart_module_invocation, ctx).await?,
+                Self::extract_smartmodule_context(smart_module_invocation, version, ctx).await?,
             )),
             None => {
                 if let Some(payload) = wasm_payload {
                     Ok(Some(Self {
-                        smartstream: Self::payload_to_smartstream(payload, ctx)?,
+                        smartstream: Self::payload_to_smartstream(payload, version, ctx)?,
                         right_consumer_stream: None,
                     }))
                 } else {
@@ -62,6 +63,7 @@ impl SmartStreamContext {
     /// given smartstream invocation and context, generate execution context
     async fn extract_smartmodule_context(
         invocation: SmartModuleInvocation,
+        version: i16,
         ctx: &DefaultSharedGlobalContext,
     ) -> Result<Self, ErrorCode> {
         // check for right consumer stream exists, this only happens for join type
@@ -165,13 +167,14 @@ impl SmartStreamContext {
         };
 
         Ok(Self {
-            smartstream: Self::payload_to_smartstream(payload, ctx)?,
+            smartstream: Self::payload_to_smartstream(payload, version, ctx)?,
             right_consumer_stream,
         })
     }
 
     fn payload_to_smartstream(
         payload: SmartStreamPayload,
+        version: i16,
         ctx: &DefaultSharedGlobalContext,
     ) -> Result<Box<dyn SmartStream>, ErrorCode> {
         let raw = payload.wasm.get_raw().map_err(|err| {
@@ -184,7 +187,7 @@ impl SmartStreamContext {
         let kind = payload.kind.clone();
 
         sm_engine
-            .create_module_from_payload(payload)
+            .create_module_from_payload(payload, Some(version))
             .map_err(|err| {
                 error!(
                     error = err.to_string().as_str(),

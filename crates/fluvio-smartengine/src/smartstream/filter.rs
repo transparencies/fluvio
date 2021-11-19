@@ -1,6 +1,5 @@
 use std::convert::TryFrom;
 use anyhow::Result;
-use fluvio_spu_schema::server::stream_fetch::WASM_MODULE_V2_API;
 use wasmtime::TypedFunc;
 
 use dataplane::smartstream::{
@@ -21,8 +20,9 @@ impl SmartStreamFilter {
         engine: &SmartEngine,
         module: &SmartStreamModule,
         params: SmartStreamExtraParams,
+        version: i16,
     ) -> Result<Self> {
-        let mut base = SmartStreamContext::new(engine, module, params)?;
+        let mut base = SmartStreamContext::new(engine, module, params, version)?;
         let filter_fn: FilterFn = base
             .instance
             .get_typed_func(&mut base.store, FILTER_FN_NAME)?;
@@ -33,7 +33,7 @@ impl SmartStreamFilter {
 
 impl SmartStream for SmartStreamFilter {
     fn process(&mut self, input: SmartStreamInput) -> Result<SmartStreamOutput> {
-        let slice = self.base.write_input(&input, WASM_MODULE_V2_API)?;
+        let slice = self.base.write_input(&input)?;
         let filter_output = self.filter_fn.call(&mut self.base.store, slice)?;
 
         if filter_output < 0 {
@@ -42,7 +42,7 @@ impl SmartStream for SmartStreamFilter {
             return Err(internal_error.into());
         }
 
-        let output: SmartStreamOutput = self.base.read_output(WASM_MODULE_V2_API)?;
+        let output: SmartStreamOutput = self.base.read_output()?;
         Ok(output)
     }
 

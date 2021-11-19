@@ -2,7 +2,6 @@ use std::convert::TryFrom;
 use anyhow::Result;
 use wasmtime::TypedFunc;
 
-use fluvio_spu_schema::server::stream_fetch::WASM_MODULE_V2_API;
 use dataplane::smartstream::{SmartStreamInput, SmartStreamOutput, SmartStreamInternalError};
 use crate::smartstream::{
     SmartEngine, SmartStreamModule, SmartStreamContext, SmartStream, SmartStreamExtraParams,
@@ -21,8 +20,9 @@ impl SmartStreamMap {
         engine: &SmartEngine,
         module: &SmartStreamModule,
         params: SmartStreamExtraParams,
+        version: i16,
     ) -> Result<Self> {
-        let mut base = SmartStreamContext::new(engine, module, params)?;
+        let mut base = SmartStreamContext::new(engine, module, params, version)?;
         let map_fn: MapFn = base.instance.get_typed_func(&mut base.store, MAP_FN_NAME)?;
 
         Ok(Self { base, map_fn })
@@ -31,7 +31,7 @@ impl SmartStreamMap {
 
 impl SmartStream for SmartStreamMap {
     fn process(&mut self, input: SmartStreamInput) -> Result<SmartStreamOutput> {
-        let slice = self.base.write_input(&input, WASM_MODULE_V2_API)?;
+        let slice = self.base.write_input(&input)?;
         let map_output = self.map_fn.call(&mut self.base.store, slice)?;
 
         if map_output < 0 {
@@ -40,7 +40,7 @@ impl SmartStream for SmartStreamMap {
             return Err(internal_error.into());
         }
 
-        let output: SmartStreamOutput = self.base.read_output(WASM_MODULE_V2_API)?;
+        let output: SmartStreamOutput = self.base.read_output()?;
         Ok(output)
     }
 

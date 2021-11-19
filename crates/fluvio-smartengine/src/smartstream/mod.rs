@@ -37,6 +37,8 @@ use fluvio_controlplane_metadata::smartmodule::{SmartModuleSpec};
 
 use self::join_stream::SmartStreamJoinStream;
 
+const DEFAULT_SMARTENGINE_VERSION: i16 = 16;
+
 #[derive(Default, Clone)]
 pub struct SmartEngine(pub(crate) Engine);
 
@@ -75,25 +77,35 @@ impl SmartEngine {
     pub fn create_module_from_payload(
         self,
         smart_payload: SmartStreamPayload,
+        maybe_version: Option<i16>,
     ) -> Result<Box<dyn SmartStream>> {
+        let version = maybe_version.unwrap_or(DEFAULT_SMARTENGINE_VERSION);
         let smart_module = self.create_module_from_binary(&smart_payload.wasm.get_raw()?)?;
         let smart_stream: Box<dyn SmartStream> = match &smart_payload.kind {
-            SmartStreamKind::Filter => Box::new(smart_module.create_filter(smart_payload.params)?),
+            SmartStreamKind::Filter => {
+                Box::new(smart_module.create_filter(smart_payload.params, version)?)
+            }
             SmartStreamKind::FilterMap => {
-                Box::new(smart_module.create_filter_map(smart_payload.params)?)
+                Box::new(smart_module.create_filter_map(smart_payload.params, version)?)
             }
-            SmartStreamKind::Map => Box::new(smart_module.create_map(smart_payload.params)?),
+            SmartStreamKind::Map => {
+                Box::new(smart_module.create_map(smart_payload.params, version)?)
+            }
             SmartStreamKind::ArrayMap => {
-                Box::new(smart_module.create_array_map(smart_payload.params)?)
+                Box::new(smart_module.create_array_map(smart_payload.params, version)?)
             }
-            SmartStreamKind::Join(_) => Box::new(smart_module.create_join(smart_payload.params)?),
+            SmartStreamKind::Join(_) => {
+                Box::new(smart_module.create_join(smart_payload.params, version)?)
+            }
             SmartStreamKind::JoinStream {
                 topic: _,
                 smartstream: _,
-            } => Box::new(smart_module.create_join_stream(smart_payload.params)?),
-            SmartStreamKind::Aggregate { accumulator } => {
-                Box::new(smart_module.create_aggregate(smart_payload.params, accumulator.clone())?)
-            }
+            } => Box::new(smart_module.create_join_stream(smart_payload.params, version)?),
+            SmartStreamKind::Aggregate { accumulator } => Box::new(smart_module.create_aggregate(
+                smart_payload.params,
+                accumulator.clone(),
+                version,
+            )?),
         };
         Ok(smart_stream)
     }
@@ -111,33 +123,49 @@ pub struct SmartStreamModule {
 }
 
 impl SmartStreamModule {
-    fn create_filter(&self, params: SmartStreamExtraParams) -> Result<SmartStreamFilter> {
-        let filter = SmartStreamFilter::new(&self.engine, self, params)?;
+    fn create_filter(
+        &self,
+        params: SmartStreamExtraParams,
+        version: i16,
+    ) -> Result<SmartStreamFilter> {
+        let filter = SmartStreamFilter::new(&self.engine, self, params, version)?;
         Ok(filter)
     }
 
-    fn create_map(&self, params: SmartStreamExtraParams) -> Result<SmartStreamMap> {
-        let map = SmartStreamMap::new(&self.engine, self, params)?;
+    fn create_map(&self, params: SmartStreamExtraParams, version: i16) -> Result<SmartStreamMap> {
+        let map = SmartStreamMap::new(&self.engine, self, params, version)?;
         Ok(map)
     }
 
-    fn create_filter_map(&self, params: SmartStreamExtraParams) -> Result<SmartStreamFilterMap> {
-        let filter_map = SmartStreamFilterMap::new(&self.engine, self, params)?;
+    fn create_filter_map(
+        &self,
+        params: SmartStreamExtraParams,
+        version: i16,
+    ) -> Result<SmartStreamFilterMap> {
+        let filter_map = SmartStreamFilterMap::new(&self.engine, self, params, version)?;
         Ok(filter_map)
     }
 
-    fn create_array_map(&self, params: SmartStreamExtraParams) -> Result<SmartStreamArrayMap> {
-        let map = SmartStreamArrayMap::new(&self.engine, self, params)?;
+    fn create_array_map(
+        &self,
+        params: SmartStreamExtraParams,
+        version: i16,
+    ) -> Result<SmartStreamArrayMap> {
+        let map = SmartStreamArrayMap::new(&self.engine, self, params, version)?;
         Ok(map)
     }
 
-    fn create_join(&self, params: SmartStreamExtraParams) -> Result<SmartStreamJoin> {
-        let join = SmartStreamJoin::new(&self.engine, self, params)?;
+    fn create_join(&self, params: SmartStreamExtraParams, version: i16) -> Result<SmartStreamJoin> {
+        let join = SmartStreamJoin::new(&self.engine, self, params, version)?;
         Ok(join)
     }
 
-    fn create_join_stream(&self, params: SmartStreamExtraParams) -> Result<SmartStreamJoinStream> {
-        let join = SmartStreamJoinStream::new(&self.engine, self, params)?;
+    fn create_join_stream(
+        &self,
+        params: SmartStreamExtraParams,
+        version: i16,
+    ) -> Result<SmartStreamJoinStream> {
+        let join = SmartStreamJoinStream::new(&self.engine, self, params, version)?;
         Ok(join)
     }
 
@@ -145,8 +173,10 @@ impl SmartStreamModule {
         &self,
         params: SmartStreamExtraParams,
         accumulator: Vec<u8>,
+        version: i16,
     ) -> Result<SmartStreamAggregate> {
-        let aggregate = SmartStreamAggregate::new(&self.engine, self, params, accumulator)?;
+        let aggregate =
+            SmartStreamAggregate::new(&self.engine, self, params, accumulator, version)?;
         Ok(aggregate)
     }
 }
@@ -156,6 +186,7 @@ pub struct SmartStreamContext {
     instance: Instance,
     records_cb: Arc<RecordsCallBack>,
     params: SmartStreamExtraParams,
+    version: i16,
 }
 
 impl SmartStreamContext {
@@ -163,6 +194,7 @@ impl SmartStreamContext {
         engine: &SmartEngine,
         module: &SmartStreamModule,
         params: SmartStreamExtraParams,
+        version: i16,
     ) -> Result<Self> {
         let mut store = Store::new(&engine.0, ());
         let cb = Arc::new(RecordsCallBack::new());
@@ -188,13 +220,14 @@ impl SmartStreamContext {
             instance,
             records_cb,
             params,
+            version,
         })
     }
 
-    pub fn write_input<E: Encoder>(&mut self, input: &E, version: i16) -> Result<WasmSlice> {
+    pub fn write_input<E: Encoder>(&mut self, input: &E) -> Result<WasmSlice> {
         self.records_cb.clear();
         let mut input_data = Vec::new();
-        input.encode(&mut input_data, version)?;
+        input.encode(&mut input_data, self.version)?;
         debug!(len = input_data.len(), "input data");
         let array_ptr =
             self::memory::copy_memory_to_instance(&mut self.store, &self.instance, &input_data)?;
@@ -202,14 +235,14 @@ impl SmartStreamContext {
         Ok((array_ptr as i32, length as i32))
     }
 
-    pub fn read_output<D: Decoder + Default>(&mut self, version: i16) -> Result<D> {
+    pub fn read_output<D: Decoder + Default>(&mut self) -> Result<D> {
         let bytes = self
             .records_cb
             .get()
             .and_then(|m| m.copy_memory_from(&mut self.store).ok())
             .unwrap_or_default();
         let mut output = D::default();
-        output.decode(&mut std::io::Cursor::new(bytes), version)?;
+        output.decode(&mut std::io::Cursor::new(bytes), self.version)?;
         Ok(output)
     }
 }
