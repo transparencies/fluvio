@@ -34,6 +34,7 @@ mod delete;
 mod error;
 mod progress;
 pub mod runtime;
+mod process;
 
 /// extensions
 #[cfg(feature = "cli")]
@@ -60,6 +61,7 @@ mod common {
 
     use anyhow::Result;
     use fluvio::config::{TlsPaths, TlsConfig};
+    use serde::{Serialize, Deserialize};
 
     /// The result of a successful startup of a Fluvio cluster
     ///
@@ -90,7 +92,7 @@ mod common {
     }
 
     /// User configuration chart location
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum UserChartLocation {
         /// Local charts must be located at a valid filesystem path.
         Local(PathBuf),

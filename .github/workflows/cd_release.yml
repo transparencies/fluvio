@@ -131,7 +131,7 @@ jobs:
         run: |
           fluvio cluster diagnostics
       - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         timeout-minutes: 5
         if: ${{ !success() }}
         with:
@@ -184,10 +184,10 @@ jobs:
           echo "EXPECTED_VERSION: $EXPECTED_VERSION"
 
       - run: echo "VERSION=$EXPECTED_VERSION" | tee -a $GITHUB_ENV
-      - name: Install current stable Fluvio CLI and upgrade cluster
+      - name: Install current latest Fluvio CLI and upgrade cluster
         run: |
-          ~/.fvm/bin/fvm install stable
-          ~/.fluvio/bin/fluvio cluster upgrade
+          ~/.fvm/bin/fvm install latest
+          ~/.fluvio/bin/fluvio cluster upgrade --force
           ~/.fluvio/bin/fluvio version
 
       # TODO: Verify platform version
@@ -196,7 +196,7 @@ jobs:
         timeout-minutes: 5
         run: ~/.fluvio/bin/fluvio cluster diagnostics
       - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         timeout-minutes: 5
         if: ${{ !success() }}
         with:

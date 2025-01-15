@@ -11,11 +11,11 @@ use async_lock::Mutex;
 use fluvio_controlplane::{replica::Replica, sc_api::update_lrs::LrsRequest};
 use tracing::{debug, error, warn};
 use tracing::instrument;
-use async_rwlock::RwLock;
+use async_lock::RwLock;
 use anyhow::{Result, Context};
 
 use fluvio_protocol::record::{RecordSet, Offset, ReplicaKey, RawRecords, Batch};
-use fluvio_controlplane_metadata::partition::{PartitionStatus, ReplicaStatus};
+use fluvio_controlplane_metadata::partition::{PartitionMirrorConfig, PartitionStatus, ReplicaStatus};
 use fluvio_storage::{FileReplica, ReplicaStorage, OffsetInfo, ReplicaStorageConfig};
 use fluvio_types::{
     event::offsets::{SharedOffsetPublisher, WeakSharedOffsetPublisher, TOPIC_DELETED},
@@ -25,13 +25,14 @@ use fluvio_spu_schema::{Isolation, COMMON_VERSION};
 
 use crate::{
     config::ReplicationConfig,
-    control_plane::SharedStatusUpdate,
+    control_plane::SharedLrsStatusUpdate,
+    core::GlobalContext,
+    mirroring::remote::controller::{MirrorRemoteToHomeController, SharedMirrorControllerState},
     smartengine::{
+        batch::process_record_set,
         context::{SharedSmartModuleContext, SmartModuleContext},
         dedup_to_invocation,
-        batch::process_record_set,
     },
-    core::GlobalContext,
 };
 use crate::replication::follower::sync::{PeerFileTopicResponse, PeerFilePartitionResponse};
 use crate::storage::SharableReplicaStorage;
@@ -50,9 +51,10 @@ pub struct LeaderReplicaState<S> {
     storage: SharableReplicaStorage<S>,
     config: ReplicationConfig,
     followers: Arc<RwLock<BTreeMap<SpuId, OffsetInfo>>>,
-    status_update: SharedStatusUpdate,
+    status_update: SharedLrsStatusUpdate,
     sm_ctx: Option<SharedSmartModuleContext>,
     consumer_offset_publishers: Arc<Mutex<Vec<WeakSharedOffsetPublisher>>>,
+    mirror_controller_state: Option<SharedMirrorControllerState>,
 }
 
 impl<S> Clone for LeaderReplicaState<S> {
@@ -66,6 +68,7 @@ impl<S> Clone for LeaderReplicaState<S> {
             status_update: self.status_update.clone(),
             sm_ctx: self.sm_ctx.clone(),
             consumer_offset_publishers: self.consumer_offset_publishers.clone(),
+            mirror_controller_state: self.mirror_controller_state.clone(),
         }
     }
 }
@@ -111,7 +114,7 @@ where
     pub fn new(
         replica: Replica,
         config: ReplicationConfig,
-        status_update: SharedStatusUpdate,
+        status_update: SharedLrsStatusUpdate,
         inner: SharableReplicaStorage<S>,
     ) -> Uninit<Self> {
         debug!(?replica, "replica storage");
@@ -136,6 +139,7 @@ where
             status_update,
             sm_ctx: None,
             consumer_offset_publishers: Arc::new(Mutex::new(Vec::new())),
+            mirror_controller_state: None,
         })
     }
 
@@ -143,7 +147,7 @@ where
     pub async fn create<'a, C>(
         replica: Replica,
         config: &'a C,
-        status_update: SharedStatusUpdate,
+        status_update: SharedLrsStatusUpdate,
     ) -> Result<Uninit<LeaderReplicaState<S>>>
     where
         ReplicationConfig: From<&'a C>,
@@ -165,6 +169,11 @@ where
     /// leader SPU. This should be same as our local SPU
     pub fn leader(&self) -> SpuId {
         self.replica.leader
+    }
+
+    /// replica metadata
+    pub fn get_replica(&self) -> &Replica {
+        &self.replica
     }
 
     /// override in sync replica
@@ -315,14 +324,20 @@ where
             .get_partition_size()
             .try_into()
             .unwrap_or(PartitionStatus::SIZE_ERROR);
+        let base_offset = storage_reader.get_log_start_offset();
 
-        LrsRequest::new(self.id().to_owned(), leader, replicas, size)
+        LrsRequest::new(self.id().to_owned(), leader, replicas, size, base_offset)
     }
 
     #[instrument(skip(self))]
     pub async fn update_status(&self) {
         let lrs = self.as_lrs_request().await;
-        debug!(hw = lrs.leader.hw, leo = lrs.leader.leo, size = lrs.size);
+        debug!(
+            hw = lrs.leader.hw,
+            leo = lrs.leader.leo,
+            size = lrs.size,
+            base_offset = lrs.base_offset
+        );
         self.status_update.send(lrs).await
     }
 
@@ -427,11 +442,39 @@ where
             }
         }
     }
+
+    /// append new record set.  this ensure record sets are aligned with leo
+    /// if not aligned, it will return false
+    pub(crate) async fn append_record_set(
+        &self,
+        records: &mut RecordSet<RawRecords>,
+        notifier: &FollowerNotifier,
+    ) -> Result<bool> {
+        let total_records = records.total_records();
+        debug!(total_records, "update from mirror source");
+        if records.total_records() == 0 {
+            debug!("no records");
+            return Ok(false);
+        }
+
+        // verify that new records are aligned with current leo
+        let storage_leo = self.leo();
+        if records.base_offset() != storage_leo {
+            return Ok(false);
+        }
+
+        self.write_record_set(records, notifier).await?;
+
+        Ok(true)
+    }
 }
 
 pub struct Uninit<S>(S);
 
-impl<S: ReplicaStorage> Uninit<LeaderReplicaState<S>> {
+impl<S: ReplicaStorage + 'static> Uninit<LeaderReplicaState<S>>
+where
+    S: Sync + Send,
+{
     pub async fn init(self, ctx: &GlobalContext<FileReplica>) -> Result<LeaderReplicaState<S>> {
         let mut state = self.0;
         if let Some(dedup) = &state.replica.deduplication {
@@ -446,7 +489,31 @@ impl<S: ReplicaStorage> Uninit<LeaderReplicaState<S>> {
                 .context("leader smartmodule context lookback failed")?;
             state.sm_ctx = Some(Arc::new(RwLock::new(sm_ctx)));
         };
+        // start up mirror controller if mirror is source
+        if let Some(mirror) = &state.replica.mirror {
+            match mirror {
+                PartitionMirrorConfig::Remote(r) => {
+                    debug!("found mirror remote, starting controller");
+                    let mirror_controller_state = MirrorRemoteToHomeController::run(
+                        ctx,
+                        state.clone(),
+                        r.clone(),
+                        Isolation::ReadUncommitted,
+                        10000000,
+                    );
+                    state.mirror_controller_state = Some(mirror_controller_state);
+                }
+                PartitionMirrorConfig::Home(_) => {
+                    debug!("ignoring home for now");
+                }
+            }
+        }
         Ok(state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_inner(self) -> LeaderReplicaState<S> {
+        self.0
     }
 }
 
@@ -774,7 +841,7 @@ mod test_leader {
     use fluvio_protocol::fixture::create_raw_recordset;
 
     use crate::config::SpuConfig;
-    use crate::control_plane::StatusMessageSink;
+    use crate::control_plane::StatusLrsMessageSink;
 
     use super::*;
 
@@ -859,7 +926,7 @@ mod test_leader {
         type ReplicaConfig = MockConfig;
 
         fn get_log_start_offset(&self) -> Offset {
-            todo!()
+            (self.pos.hw * 10) as Offset
         }
 
         async fn remove(&self) -> Result<(), fluvio_storage::StorageError> {
@@ -879,7 +946,7 @@ mod test_leader {
         let state: LeaderReplicaState<MockStorage> = LeaderReplicaState::create(
             Replica::new(replica, 5000, vec![5000]),
             &leader_config,
-            StatusMessageSink::shared(),
+            StatusLrsMessageSink::shared(),
         )
         .await
         .expect("state")
@@ -902,7 +969,7 @@ mod test_leader {
         let state: LeaderReplicaState<MockStorage> = LeaderReplicaState::create(
             Replica::new(replica, 5000, vec![5001, 5002]),
             &leader_config,
-            StatusMessageSink::shared(),
+            StatusLrsMessageSink::shared(),
         )
         .await
         .expect("state")
@@ -998,7 +1065,7 @@ mod test_leader {
         let leader: LeaderReplicaState<MockStorage> = LeaderReplicaState::create(
             Replica::new(replica.clone(), 5000, vec![5000, 5001, 5002]),
             gctx.config(),
-            StatusMessageSink::shared(),
+            StatusLrsMessageSink::shared(),
         )
         .await
         .expect("state")

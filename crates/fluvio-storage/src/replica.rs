@@ -132,14 +132,22 @@ impl ReplicaStorage for FileReplica {
         records: &mut RecordSet<R>,
         update_highwatermark: bool,
     ) -> Result<usize> {
-        let max_batch_size = self.option.max_batch_size.get() as usize;
+        let max_request_size = self.option.max_request_size.get() as usize;
+        let max_segment_size = self.option.segment_max_bytes.get() as usize;
         let mut total_size = 0;
         // check if any of the records's batch exceed max length
         for batch in &records.batches {
             let batch_size = batch.write_size(0);
+            if batch_size > max_segment_size {
+                return Err(StorageError::BatchExceededSegment {
+                    batch_size: batch_size.try_into()?,
+                    max_segment_size: max_segment_size.try_into()?,
+                }
+                .into());
+            }
             total_size += batch_size;
-            if batch_size > max_batch_size {
-                return Err(StorageError::BatchTooBig(max_batch_size).into());
+            if batch_size > max_request_size {
+                return Err(StorageError::BatchTooBig(max_request_size).into());
             }
         }
 
@@ -261,6 +269,8 @@ impl FileReplica {
         }
 
         let size = Arc::new(ReplicaSize::default());
+        size.store_active(active_segment.occupied_memory());
+
         let cleaner = Cleaner::start_new(
             storage_config,
             shared_config.clone(),
@@ -359,6 +369,10 @@ impl FileReplica {
             self.prev_segments
                 .find_slice(start_offset, max_offset)
                 .await?
+                .ok_or_else(|| ErrorCode::OffsetEvicted {
+                    offset: start_offset,
+                    next_available: self.get_log_start_offset(),
+                })?
         };
 
         let limited_slice = AsyncFileSlice::new(
@@ -385,6 +399,7 @@ impl FileReplica {
                 partition = self.partition,
                 path = %self.option.base_dir.display(),
                 base_offset = self.active_segment.get_base_offset(),
+                end_offset = self.active_segment.get_end_offset(),
                 "rolling over active segment");
             self.active_segment.roll_over().await?;
             let last_offset = self.active_segment.get_end_offset();
@@ -450,6 +465,7 @@ mod tests {
     use std::time::Duration;
 
     use fluvio_spu_schema::Isolation;
+    use fluvio_protocol::link::ErrorCode;
     use fluvio_protocol::record::Batch;
     use fluvio_protocol::record::Offset;
     use fluvio_protocol::{Decoder, Encoder};
@@ -622,7 +638,7 @@ mod tests {
     const TEST_OFFSET_DIR: &str = "test_offset";
 
     #[fluvio_future::test]
-    async fn test_replica_end_offset() {
+    async fn test_replica_load_end_offset_and_size() {
         let option = base_option(TEST_OFFSET_DIR);
 
         let mut rep_sink = create_replica("test", START_OFFSET, option.clone()).await;
@@ -639,6 +655,7 @@ mod tests {
         // open replica
         let replica2 = create_replica("test", 0, option).await;
         assert_eq!(replica2.get_leo(), START_OFFSET + 4); // should be 24 since we added 4 records
+        assert_eq!(replica2.size.get(), 158);
     }
 
     const TEST_REPLICA_DIR: &str = "test_replica";
@@ -845,9 +862,9 @@ mod tests {
     }
 
     #[fluvio_future::test]
-    async fn test_replica_limit_batch() {
+    async fn test_replica_limit_request_size() {
         let mut option = base_option("test_batch_limit");
-        option.max_batch_size = 100;
+        option.max_request_size = 100;
         option.update_hw = false;
 
         let mut replica = create_replica("test", START_OFFSET, option).await;
@@ -1003,6 +1020,14 @@ mod tests {
         assert_eq!(reader.len(), 0);
         drop(reader);
 
+        assert!(matches!(
+            new_replica.read_records(1, None, 1024).await, //offset must not be available
+            Err(ErrorCode::OffsetEvicted {
+                offset: 1,
+                next_available: 4,
+            })
+        ));
+
         new_replica.remove().await.expect("remove");
         drop(new_replica);
         sleep(Duration::from_millis(300)).await; // clear should end
@@ -1123,5 +1148,39 @@ mod tests {
         assert_eq!(repaird_fs_len, original_fs_len);
 
         // reopen replica
+    }
+
+    #[fluvio_future::test]
+    async fn test_replica_batch_exceeded_segment_size() {
+        let mut option = base_option("test_batch_limit");
+        option.segment_max_bytes = 100;
+        option.update_hw = false;
+
+        let mut replica = create_replica("test", START_OFFSET, option).await;
+
+        let mut small_batch = BatchProducer::builder().build().expect("batch").records();
+        assert!(small_batch.write_size(0) < 100); // ensure we are writing less than 100 bytes
+        replica
+            .write_recordset(&mut small_batch, true)
+            .await
+            .expect("writing records");
+
+        let mut largest_batch = BatchProducer::builder()
+            .per_record_bytes(200)
+            .build()
+            .expect("batch")
+            .records();
+        assert!(largest_batch.write_size(0) > 100); // ensure we are writing more than 100
+        let err = replica
+            .write_recordset(&mut largest_batch, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StorageError>().expect("downcast"),
+            StorageError::BatchExceededSegment {
+                batch_size: _,
+                max_segment_size: 100,
+            }
+        ));
     }
 }
