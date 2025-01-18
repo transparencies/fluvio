@@ -2,14 +2,14 @@ mod config;
 use config::CustomConfig;
 
 {% if connector-type == "source" %}
-use fluvio::{RecordKey, TopicProducer};
+use fluvio::{RecordKey, TopicProducerPool};
 use fluvio_connector_common::{
     connector,
     Result
 };
 
 #[connector(source)]
-async fn start(config: CustomConfig, producer: TopicProducer) -> Result<()> {
+async fn start(config: CustomConfig, producer: TopicProducerPool) -> Result<()> {
     println!("Starting {{project-name}} source connector with {config:?}");
     for i in 1..1000 {
         let value = format!("Hello, Fluvio - {i}");
@@ -21,6 +21,8 @@ async fn start(config: CustomConfig, producer: TopicProducer) -> Result<()> {
 }
 
 {% elsif connector-type == "sink" %}
+use futures::StreamExt;
+
 use fluvio_connector_common::{connector, consumer::ConsumerStream, Result};
 
 #[connector(sink)]

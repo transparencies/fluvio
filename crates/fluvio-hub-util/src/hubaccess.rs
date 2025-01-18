@@ -1,26 +1,42 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::anyhow;
+
+#[cfg(not(target_arch = "wasm32"))]
+use tracing::info;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use http::StatusCode;
-use tracing::{debug, info};
+use tracing::debug;
 
+#[cfg(not(target_arch = "wasm32"))]
 use fluvio_future::task::run_block_on;
-use fluvio_hub_protocol::{Result, HubError};
-use fluvio_hub_protocol::infinyon_tok::read_infinyon_token;
+
+#[cfg(not(target_arch = "wasm32"))]
 use fluvio_hub_protocol::infinyon_tok::read_infinyon_token_rem;
+
+use fluvio_hub_protocol::{Result, HubError};
+use fluvio_hub_protocol::infinyon_tok::read_access_token;
 use fluvio_hub_protocol::constants::{HUB_API_ACT, HUB_API_HUBID, HUB_REMOTE, CLI_CONFIG_HUB};
 use fluvio_types::defaults::CLI_CONFIG_PATH;
+use fluvio_hub_protocol::infinyon_tok::AccessToken;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::htclient;
 
 use crate::keymgmt::Keypair;
-use crate::htclient;
 use crate::htclient::ResponseExt;
+
+#[cfg(not(target_arch = "wasm32"))]
+const ACCESS_FILE_DEF: &str = "default"; // default profile name
+
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_CLOUD_REMOTE: &str = "https://infinyon.cloud";
 
 // in .fluvio/hub/hcurrent
 const ACCESS_FILE_PTR: &str = "hcurrent";
-const ACCESS_FILE_DEF: &str = "default"; // default profile name
-const DEFAULT_CLOUD_REMOTE: &str = "https://infinyon.cloud";
 
 pub const ACTION_LIST: &str = "list";
 pub const ACTION_LIST_WITH_META: &str = "lwm";
@@ -50,10 +66,18 @@ impl HubAccess {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn default_load(remote: &Option<String>) -> Result<Self> {
         let cfgpath = default_cfg_path()?;
         let profileopt = std::env::var(FLUVIO_HUB_PROFILE_ENV).ok();
         HubAccess::load_path(cfgpath, profileopt, remote)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn default_load(_remote: &Option<String>) -> Result<Self> {
+        Err(HubError::General(String::from(
+            "Support for `HubAccess::default_load` is not available for `wasm32`",
+        )))
     }
 
     pub async fn create_hubid(&self, hubid: &str) -> Result<()> {
@@ -125,16 +149,18 @@ impl HubAccess {
         &self,
         action: &str,
         authn_token: &str,
+        remote: &str,
     ) -> Result<String> {
-        self.make_action_token(action, authn_token.into()).await
+        let access_token = AccessToken::V3((authn_token.to_string(), remote.to_string()));
+        self.make_action_token(action, Some(access_token)).await
     }
 
     async fn get_action_auth(&self, action: &str) -> Result<String> {
-        let cloud_token = read_infinyon_token().unwrap_or_default();
-        self.make_action_token(action, cloud_token).await
+        let access_token = read_access_token().ok();
+        self.make_action_token(action, access_token).await
     }
 
-    async fn make_action_token(&self, action: &str, authn_token: String) -> Result<String> {
+    async fn make_action_token(&self, action: &str, token: Option<AccessToken>) -> Result<String> {
         let host = &self.remote;
         let api_url = format!("{host}/{HUB_API_ACT}");
         let mat = MsgActionToken {
@@ -143,9 +169,24 @@ impl HubAccess {
         let msg_action_token = serde_json::to_string(&mat)
             .map_err(|_e| HubError::HubAccess("Failed access setup".to_string()))?;
 
-        let mut builder = http::Request::get(&api_url);
-        if !authn_token.is_empty() {
-            builder = builder.header("Authorization", &authn_token);
+        let mut builder = http::Request::post(&api_url);
+        match token {
+            Some(token) => {
+                let auth_token = token.get_token()?;
+                match token {
+                    AccessToken::V4(_) => {
+                        builder = builder.header("Authorization", format!("Bearer {auth_token}"));
+                    }
+                    AccessToken::V3(_) => {
+                        // v3 does not use "Bearer" prefix
+                        builder = builder.header("Authorization", auth_token);
+                    }
+                }
+            }
+            None => {
+                // no token is allowed for some actions like downloading public
+                // packages
+            }
         }
         let req = builder
             .header(http::header::CONTENT_TYPE, mime::JSON.as_str())
@@ -159,10 +200,9 @@ impl HubAccess {
         let status_code = resp.status();
         match status_code {
             StatusCode::OK => {
-                let action_token = resp.body_string().await.map_err(|e| {
-                    debug!("err {e}");
-                    HubError::HubAccess("Failed to parse reply".to_string())
-                })?;
+                let action_token = resp
+                    .body_string()
+                    .map_err(|e| HubError::General(format!("couldn't parse body {e}")))?;
                 Ok(action_token)
             }
             StatusCode::UNAUTHORIZED => Err(HubError::HubAccess(
@@ -189,6 +229,7 @@ impl HubAccess {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_path<P: AsRef<Path>>(
         base_path: P,
         profile_in: Option<String>,
@@ -308,13 +349,15 @@ pub fn default_cfg_path() -> Result<PathBuf> {
     Ok(hub_cfg_path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Deserialize)]
 struct ReplyHubref {
     hub_remote: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn get_hubref() -> Option<String> {
-    let Ok((_, fcremote)) = read_infinyon_token_rem() else {
+    let Ok(fcremote) = read_infinyon_token_rem() else {
         return None;
     };
     if fcremote == DEFAULT_CLOUD_REMOTE {
@@ -327,7 +370,6 @@ fn get_hubref() -> Option<String> {
             .map_err(|e| anyhow!("hubref error {e}"))?;
         let reply = resp
             .json::<ReplyHubref>()
-            .await
             .map_err(|e| anyhow!("hubref parse error {e}"))?;
 
         // fluvio profile switch does not switch the cloud login
