@@ -147,8 +147,8 @@ Fluvio applies wasm based stream processing and data transformations. We call th
 
 **Language Specifc API docs:**
 - [Rust API docs](https://docs.rs/fluvio/latest/fluvio/)
-- [Python API docs](https://infinyon.github.io/fluvio-client-python/fluvio.html)
-- [Javascript API docs](https://infinyon.github.io/fluvio-client-node/)
+- [Python API docs](https://www.fluvio.io/docs/fluvio/apis/python/example)
+- [Javascript API docs](https://github.com/fluvio-community/fluvio-client-node)
 
 **Community Maintained:**
 - [Go API docs](https://github.com/avinassh/fluvio-go)
